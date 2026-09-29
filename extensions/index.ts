@@ -46,7 +46,7 @@ const PROVIDER_ID = "codegpt";
 /** Custom api id; its stream delegates to pi's openai-completions with codegptFetch. */
 const API_ID = "codegpt-chat-tools";
 
-/** CodeGPT session tokens arrive as `session-<token>` and never expire. */
+/** Env var holding a CodeGPT session token; skips the browser login. */
 const SESSION_TOKEN_ENV = "CODEGPT_SESSION_TOKEN";
 
 /**
@@ -59,7 +59,7 @@ const BASE_AGENT_ID = "2385a3fe-c991-4070-bac2-ecbad0840b70";
 /** Channel label the backend accepts for this bridge. */
 const CHANNEL = "codegpt-pi";
 
-/** A far-future expiry (seconds) means "does not expire". */
+/** A far-future expiry (ms, 9999-12-31) means "does not expire". */
 const NEVER_EXPIRES_MS = 253402300799000;
 
 /**
@@ -69,6 +69,18 @@ const NEVER_EXPIRES_MS = 253402300799000;
  * real CodeGPT model id.
  */
 const TIER_SEPARATOR = "/";
+
+/**
+ * CodeGPT refusal codes for a spent plan or balance. Retrying cannot succeed,
+ * but pi decides retries by matching error text (a "$500" in the copy reads as
+ * HTTP 500), so these refusals carry "quota exceeded", which pi never retries.
+ */
+const HARD_LIMIT_CODES = new Set([
+	"DAILY_INTERACTIONS_LIMIT_REACHED",
+	"DAILY_CREDIT_USAGE_REACHED",
+	"NOT_ENOUGH_CREDIT",
+	"FREE_DAILY_LIMIT_REACHED",
+]);
 
 /** Matches the tier suffix appended to a model id; stripped before the wire. */
 const TIER_SUFFIX_RE = /\/(economy|free|premium)$/i;
@@ -120,7 +132,7 @@ function portableSchema(value: unknown): Record<string, unknown> {
 }
 
 // Strip JSON-invalid control characters (strict model servers reject raw NUL/ESC).
-// Tool results are held to NUL only so file bytes edit matches on are preserved.
+// Tool results strip NUL only, preserving the exact bytes edit tools match on.
 const JSON_UNSAFE_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g;
 const NUL_ONLY = /\u0000/g;
 
@@ -239,14 +251,6 @@ async function refreshCodeGPTToken(credentials: OAuthCredentials): Promise<OAuth
 // Model catalog
 // =============================================================================
 
-type CatalogModel = {
-	id: string;
-	name: string;
-	vision: boolean;
-	contextWindow: number;
-	maxTokens: number;
-};
-
 let cachedModels: ProviderModelConfig[] | null = null;
 
 /**
@@ -286,7 +290,7 @@ async function fetchCatalogModels(signal?: AbortSignal): Promise<ProviderModelCo
 				name: typeof entry.name === "string" && entry.name ? entry.name : entry.id,
 				reasoning: false,
 				input: fact.vision === true ? ["text", "image"] : ["text"],
-				// CodeGPT bills the serve against the signed-in account; a second,
+				// CodeGPT bills the request to the signed-in account; a second,
 				// per-token cost in pi's readout would be wrong.
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: typeof fact.contextWindow === "number" ? fact.contextWindow : 128000,
@@ -312,10 +316,6 @@ async function refreshCodeGPTModels(context: { signal?: AbortSignal }): Promise<
 // Transport: pi's openai-completions stream -> CodeGPT /chat/tools
 // =============================================================================
 
-function jsonResponse(status: number, body: unknown): Response {
-	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-}
-
 function firstString(...values: unknown[]): string | undefined {
 	return values.find((v): v is string => typeof v === "string" && v.trim() !== "");
 }
@@ -325,6 +325,7 @@ function firstString(...values: unknown[]): string | undefined {
  * `{title, subtitle, message, modal, code}`, others `{message}` or
  * `{error: {message}}`. Reduce it to the server's copy as a plain-text body:
  * pi then shows "403 <copy>", where a JSON body would be echoed back raw.
+ * Hard limits get a "(CodeGPT quota exceeded: <code>)" tag; see HARD_LIMIT_CODES.
  */
 async function toReadableError(upstream: Response): Promise<Response> {
 	const text = await upstream.text();
@@ -339,7 +340,9 @@ async function toReadableError(upstream: Response): Promise<Response> {
 		firstString(text) ??
 		`CodeGPT request failed (HTTP ${upstream.status})`;
 	const title = firstString(parsed?.title);
-	const message = title && !detail.startsWith(title) ? `${title}. ${detail}` : detail;
+	const copy = title && !detail.startsWith(title) ? `${title}. ${detail}` : detail;
+	const code = firstString(parsed?.code, parsed?.error?.code);
+	const message = code && HARD_LIMIT_CODES.has(code) ? `${copy} (CodeGPT quota exceeded: ${code})` : copy;
 	return new Response(message, { status: upstream.status, headers: { "content-type": "text/plain" } });
 }
 
@@ -401,34 +404,16 @@ function withUsageChunk(body: ReadableStream<Uint8Array>, model: unknown, prompt
 }
 
 /**
- * The `fetch` handed to pi's OpenAI client. It receives the client's
- * `POST <baseUrl>/chat/completions` and sends the CodeGPT equivalent instead.
+ * The `fetch` handed to pi's OpenAI client. Its only call is the streaming
+ * `POST <baseUrl>/chat/completions`; send the CodeGPT equivalent instead.
  */
-async function codegptFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
-	const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-	if (!new URL(url).pathname.endsWith("/chat/completions")) {
-		return jsonResponse(404, { error: { message: `codegpt-pi does not handle ${url}` } });
-	}
-
+async function codegptFetch(_input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
 	const auth = new Headers(init?.headers).get("authorization") ?? "";
-	if (!auth.startsWith("Bearer ")) {
-		return jsonResponse(401, { error: { message: "Missing CodeGPT session token; run /login codegpt." } });
-	}
-
-	let body: any;
-	try {
-		body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
-	} catch {
-		return jsonResponse(400, { error: { message: "Invalid JSON body" } });
-	}
-	if (!Array.isArray(body.messages)) {
-		return jsonResponse(400, { error: { message: "messages is required" } });
-	}
+	const body = JSON.parse(String(init?.body ?? "{}"));
 
 	const wireModel = typeof body.model === "string" ? body.model.replace(TIER_SUFFIX_RE, "") : body.model;
 	const codegptMessages = sanitizeMessages(body.messages);
 	const promptTokens = Math.ceil(JSON.stringify(codegptMessages).length / 4);
-	const stream = body.stream !== false;
 
 	const upstream = await fetch(`${backend()}/chat/tools`, {
 		method: "POST",
@@ -450,14 +435,14 @@ async function codegptFetch(input: Parameters<typeof fetch>[0], init?: RequestIn
 			tools: toolsForBackend(body.tools),
 			tool_choice: typeof body.tool_choice === "string" ? body.tool_choice : undefined,
 			client_tools_only: true,
-			stream,
+			stream: true,
 			format: "json",
 		}),
 		signal: init?.signal,
 	});
 
 	if (!upstream.ok) return toReadableError(upstream);
-	if (!stream || !upstream.body) return upstream;
+	if (!upstream.body) return upstream;
 
 	return new Response(withUsageChunk(upstream.body, wireModel, promptTokens), {
 		status: upstream.status,
@@ -490,7 +475,7 @@ export default async function codegptPi(pi: ExtensionAPI) {
 	try {
 		seed = await fetchCatalogModels();
 	} catch {
-		seed = cachedModels ?? [];
+		// Catalog unreachable: register without models.
 	}
 
 	pi.registerProvider(PROVIDER_ID, {
@@ -499,7 +484,6 @@ export default async function codegptPi(pi: ExtensionAPI) {
 		api: API_ID,
 		// Fallback for headless/CI: a session token copied from elsewhere.
 		apiKey: `$${SESSION_TOKEN_ENV}`,
-		authHeader: true,
 		models: seed,
 		refreshModels: refreshCodeGPTModels,
 		oauth: {
