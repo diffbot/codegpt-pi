@@ -1,0 +1,54 @@
+{
+  "name": "@diffbot/codegpt-pi",
+  "version": "0.1.0",
+  "description": "Bring your CodeGPT subscription to Pi",
+  "type": "module",
+  "license": "MIT",
+  "author": "Diffbot",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "codegpt",
+    "provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/diffbot/codegpt-pi.git"
+  },
+  "homepage": "https://github.com/diffbot/codegpt-pi#readme",
+  "bugs": {
+    "url": "https://github.com/diffbot/codegpt-pi/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "extensions",
+    "assets",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.99.0",
+    "@earendil-works/pi-coding-agent": "^0.99.0",
+    "@types/node": "^22.15.21",
+    "typescript": "^5.8.3"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "image": "https://github.com/diffbot/codegpt-pi/raw/main/assets/logo.png"
+  }
+}
