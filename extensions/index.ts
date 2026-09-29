@@ -6,10 +6,11 @@
  * (a browser URL plus a server-push SSE channel), and inference goes straight to
  * api.codegpt.co.
  *
- * Why a loopback proxy: pi's built-in `openai-completions` client is pointed at
- * a small HTTP server started here. The proxy rewrites the OpenAI request into
- * the shape CodeGPT's `/chat/tools` route expects (agentId, requestId, bare
- * tool definitions) and pipes CodeGPT's OpenAI-format SSE straight back, so pi
+ * Transport: the provider delegates to pi's built-in `openai-completions`
+ * stream with a custom `fetch`. That fetch rewrites the OpenAI request into the
+ * shape CodeGPT's `/chat/tools` route expects (agentId, requestId, bare tool
+ * definitions), pipes CodeGPT's OpenAI-format SSE straight back, and reduces
+ * CodeGPT refusals (plan limits, credits) to the server's readable copy. Pi
  * keeps its own message/tool conversion, usage accounting, and cancellation.
  *
  * Usage inside a normal pi install:
@@ -24,16 +25,26 @@
  * Env overrides (useful for staging): CODEGPT_BACKEND_URL, CODEGPT_PLAYGROUND_URL.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type AssistantMessageEventStream,
+	type Model,
+	openAICompletionsApi,
+	type SimpleStreamOptions,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai/compat";
 
 // =============================================================================
 // Constants
 // =============================================================================
 
 const PROVIDER_ID = "codegpt";
+
+/** Custom api id; its stream delegates to pi's openai-completions with codegptFetch. */
+const API_ID = "codegpt-chat-tools";
 
 /** CodeGPT session tokens arrive as `session-<token>` and never expire. */
 const SESSION_TOKEN_ENV = "CODEGPT_SESSION_TOKEN";
@@ -54,7 +65,7 @@ const NEVER_EXPIRES_MS = 253402300799000;
 /**
  * The model picker row and --list-models print the model id, not the name, and
  * pi exposes no tier/badge field — so the tier is appended to the id here and
- * stripped by the proxy before the request goes to CodeGPT. Never appears in a
+ * stripped by codegptFetch before the request goes to CodeGPT. Never appears in a
  * real CodeGPT model id.
  */
 const TIER_SEPARATOR = "/";
@@ -270,7 +281,7 @@ async function fetchCatalogModels(signal?: AbortSignal): Promise<ProviderModelCo
 			const tier = tierOf(entry);
 			return {
 				// Tier lives in the id so the picker row and --list-models show it;
-				// the proxy strips it before the wire (see TIER_SEPARATOR).
+				// codegptFetch strips it before the wire (see TIER_SEPARATOR).
 				id: `${entry.id}${TIER_SEPARATOR}${tier.toLowerCase()}`,
 				name: typeof entry.name === "string" && entry.name ? entry.name : entry.id,
 				reasoning: false,
@@ -298,54 +309,126 @@ async function refreshCodeGPTModels(context: { signal?: AbortSignal }): Promise<
 }
 
 // =============================================================================
-// Loopback proxy: OpenAI Chat Completions -> CodeGPT /chat/tools
+// Transport: pi's openai-completions stream -> CodeGPT /chat/tools
 // =============================================================================
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-	return new Promise((resolve, reject) => {
-		const chunks: Buffer[] = [];
-		req.on("data", (chunk) => chunks.push(chunk as Buffer));
-		req.on("end", () => resolve(Buffer.concat(chunks)));
-		req.on("error", reject);
-	});
+function jsonResponse(status: number, body: unknown): Response {
+	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-	if (res.headersSent) {
-		res.end();
-		return;
+function firstString(...values: unknown[]): string | undefined {
+	return values.find((v): v is string => typeof v === "string" && v.trim() !== "");
+}
+
+/**
+ * CodeGPT refuses with its own body shape — plan walls send
+ * `{title, subtitle, message, modal, code}`, others `{message}` or
+ * `{error: {message}}`. Reduce it to the server's copy as a plain-text body:
+ * pi then shows "403 <copy>", where a JSON body would be echoed back raw.
+ */
+async function toReadableError(upstream: Response): Promise<Response> {
+	const text = await upstream.text();
+	let parsed: any;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		parsed = undefined;
 	}
-	res.writeHead(status, { "content-type": "application/json" });
-	res.end(JSON.stringify(body));
+	const detail =
+		firstString(parsed?.message, parsed?.subtitle, parsed?.error?.message, parsed?.error) ??
+		firstString(text) ??
+		`CodeGPT request failed (HTTP ${upstream.status})`;
+	const title = firstString(parsed?.title);
+	const message = title && !detail.startsWith(title) ? `${title}. ${detail}` : detail;
+	return new Response(message, { status: upstream.status, headers: { "content-type": "text/plain" } });
 }
 
-async function handleCompletion(req: IncomingMessage, res: ServerResponse): Promise<void> {
-	const auth = req.headers.authorization ?? "";
+/**
+ * CodeGPT's stream omits token usage (it bills server-side but never emits a
+ * usage chunk), which leaves pi's usage.output at 0 and breaks rate/token
+ * readouts. Count the streamed output and append an OpenAI usage chunk before
+ * [DONE]. Token counts are approximate (chars/4); cost stays zero.
+ */
+function withUsageChunk(body: ReadableStream<Uint8Array>, model: unknown, promptTokens: number): ReadableStream<Uint8Array> {
+	const decoder = new TextDecoder();
+	const encoder = new TextEncoder();
+	let buffer = "";
+	let outputChars = 0;
+
+	const forward = (line: string, controller: TransformStreamDefaultController<Uint8Array>) => {
+		const trimmed = line.trim();
+		if (trimmed === "data: [DONE]") return;
+		if (trimmed.startsWith("data: ")) {
+			try {
+				const delta = JSON.parse(trimmed.slice(6))?.choices?.[0]?.delta;
+				if (typeof delta?.content === "string") outputChars += delta.content.length;
+				if (Array.isArray(delta?.tool_calls)) {
+					for (const call of delta.tool_calls) outputChars += call?.function?.arguments?.length ?? 0;
+				}
+			} catch {
+				/* non-JSON frame */
+			}
+		}
+		controller.enqueue(encoder.encode(line + "\n"));
+	};
+
+	return body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				buffer += decoder.decode(chunk, { stream: true });
+				let newline: number;
+				while ((newline = buffer.indexOf("\n")) > -1) {
+					forward(buffer.slice(0, newline), controller);
+					buffer = buffer.slice(newline + 1);
+				}
+			},
+			flush(controller) {
+				buffer += decoder.decode();
+				if (buffer) forward(buffer, controller);
+				const completion = Math.max(1, Math.ceil(outputChars / 4));
+				const usage = {
+					id: "chatcmpl-codegpt",
+					object: "chat.completion.chunk",
+					created: Math.floor(Date.now() / 1000),
+					model,
+					choices: [],
+					usage: { prompt_tokens: promptTokens, completion_tokens: completion, total_tokens: promptTokens + completion },
+				};
+				controller.enqueue(encoder.encode(`\ndata: ${JSON.stringify(usage)}\n\ndata: [DONE]\n\n`));
+			},
+		}),
+	);
+}
+
+/**
+ * The `fetch` handed to pi's OpenAI client. It receives the client's
+ * `POST <baseUrl>/chat/completions` and sends the CodeGPT equivalent instead.
+ */
+async function codegptFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
+	const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+	if (!new URL(url).pathname.endsWith("/chat/completions")) {
+		return jsonResponse(404, { error: { message: `codegpt-pi does not handle ${url}` } });
+	}
+
+	const auth = new Headers(init?.headers).get("authorization") ?? "";
 	if (!auth.startsWith("Bearer ")) {
-		sendJson(res, 401, { error: { message: "Missing CodeGPT session token; run /login codegpt." } });
-		return;
+		return jsonResponse(401, { error: { message: "Missing CodeGPT session token; run /login codegpt." } });
 	}
 
 	let body: any;
 	try {
-		body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+		body = JSON.parse(typeof init?.body === "string" ? init.body : "{}");
 	} catch {
-		sendJson(res, 400, { error: { message: "Invalid JSON body" } });
-		return;
+		return jsonResponse(400, { error: { message: "Invalid JSON body" } });
 	}
 	if (!Array.isArray(body.messages)) {
-		sendJson(res, 400, { error: { message: "messages is required" } });
-		return;
+		return jsonResponse(400, { error: { message: "messages is required" } });
 	}
-
-	const controller = new AbortController();
-	res.on("close", () => {
-		if (!res.writableEnded) controller.abort();
-	});
 
 	const wireModel = typeof body.model === "string" ? body.model.replace(TIER_SUFFIX_RE, "") : body.model;
 	const codegptMessages = sanitizeMessages(body.messages);
 	const promptTokens = Math.ceil(JSON.stringify(codegptMessages).length / 4);
+	const stream = body.stream !== false;
 
 	const upstream = await fetch(`${backend()}/chat/tools`, {
 		method: "POST",
@@ -367,102 +450,32 @@ async function handleCompletion(req: IncomingMessage, res: ServerResponse): Prom
 			tools: toolsForBackend(body.tools),
 			tool_choice: typeof body.tool_choice === "string" ? body.tool_choice : undefined,
 			client_tools_only: true,
-			stream: body.stream !== false,
+			stream,
 			format: "json",
 		}),
-		signal: controller.signal,
+		signal: init?.signal,
 	});
 
-	res.writeHead(upstream.status, {
-		"content-type": upstream.headers.get("content-type") ?? "text/event-stream",
-		"cache-control": "no-cache",
+	if (!upstream.ok) return toReadableError(upstream);
+	if (!stream || !upstream.body) return upstream;
+
+	return new Response(withUsageChunk(upstream.body, wireModel, promptTokens), {
+		status: upstream.status,
+		headers: {
+			"content-type": upstream.headers.get("content-type") ?? "text/event-stream",
+			"cache-control": "no-cache",
+		},
 	});
-	if (!upstream.body) {
-		res.end();
-		return;
-	}
-
-	// CodeGPT's stream omits token usage (it bills server-side but never emits a
-	// usage chunk), which leaves pi's usage.output at 0 and breaks rate/token
-	// readouts. Count the streamed output and append an OpenAI usage chunk before
-	// [DONE]. Token counts are approximate (chars/4); cost stays zero.
-	if (body.stream === false) {
-		const reader = upstream.body.getReader();
-		for (;;) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			res.write(Buffer.from(value));
-		}
-		res.end();
-		return;
-	}
-
-	const reader = upstream.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	let outputChars = 0;
-	const writeUsage = () => {
-		const completion = Math.max(1, Math.ceil(outputChars / 4));
-		res.write(
-			`data: ${JSON.stringify({
-				id: "chatcmpl-codegpt",
-				object: "chat.completion.chunk",
-				created: Math.floor(Date.now() / 1000),
-				model: wireModel,
-				choices: [],
-				usage: { prompt_tokens: promptTokens, completion_tokens: completion, total_tokens: promptTokens + completion },
-			})}\n\n`,
-		);
-		res.write("data: [DONE]\n\n");
-	};
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		let newline: number;
-		while ((newline = buffer.indexOf("\n")) > -1) {
-			const line = buffer.slice(0, newline);
-			buffer = buffer.slice(newline + 1);
-			const trimmed = line.trim();
-			if (trimmed === "data: [DONE]") continue;
-			if (trimmed.startsWith("data: ")) {
-				try {
-					const delta = JSON.parse(trimmed.slice(6))?.choices?.[0]?.delta;
-					if (typeof delta?.content === "string") outputChars += delta.content.length;
-					if (Array.isArray(delta?.tool_calls)) {
-						for (const call of delta.tool_calls) outputChars += call?.function?.arguments?.length ?? 0;
-					}
-				} catch {
-					/* non-JSON frame */
-				}
-			}
-			res.write(line + "\n");
-		}
-	}
-	if (buffer) res.write(buffer);
-	writeUsage();
-	res.end();
 }
 
-function startProxy(): Promise<string> {
-	const server = createServer((req, res) => {
-		const path = (req.url ?? "").split("?")[0];
-		if (req.method !== "POST" || path !== "/chat/completions") {
-			sendJson(res, 404, { error: { message: "Not found" } });
-			return;
-		}
-		handleCompletion(req, res).catch((error) => {
-			sendJson(res, 502, { error: { message: error instanceof Error ? error.message : String(error) } });
-		});
-	});
-	return new Promise((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(0, "127.0.0.1", () => {
-			const address = server.address();
-			const port = typeof address === "object" && address ? address.port : 0;
-			server.unref();
-			resolve(`http://127.0.0.1:${port}`);
-		});
+function streamCodeGPT(
+	model: Model<Api>,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	return openAICompletionsApi().streamSimple(model as Model<"openai-completions">, context, {
+		...options,
+		fetch: codegptFetch,
 	});
 }
 
@@ -471,8 +484,6 @@ function startProxy(): Promise<string> {
 // =============================================================================
 
 export default async function codegptPi(pi: ExtensionAPI) {
-	const baseUrl = await startProxy();
-
 	// Seed the static list in the (awaited) factory so `--model codegpt/<id>`
 	// resolves on a cold start; refreshModels only updates it afterwards.
 	let seed: ProviderModelConfig[] = [];
@@ -484,8 +495,8 @@ export default async function codegptPi(pi: ExtensionAPI) {
 
 	pi.registerProvider(PROVIDER_ID, {
 		name: "CodeGPT",
-		baseUrl,
-		api: "openai-completions",
+		baseUrl: backend(),
+		api: API_ID,
 		// Fallback for headless/CI: a session token copied from elsewhere.
 		apiKey: `$${SESSION_TOKEN_ENV}`,
 		authHeader: true,
@@ -498,8 +509,9 @@ export default async function codegptPi(pi: ExtensionAPI) {
 			refreshToken: refreshCodeGPTToken,
 			getApiKey: (credentials) => credentials.access,
 		},
+		streamSimple: streamCodeGPT,
 	});
 }
 
 // Named exports kept for testing without loading pi.
-export { fetchCatalogModels, loginCodeGPT };
+export { codegptFetch, fetchCatalogModels, loginCodeGPT };
